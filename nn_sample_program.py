@@ -22,7 +22,7 @@ xLength = [768, 768] # expected input size of each option
 
 print("Saving .pickle data with options: " + fpOptions)
 pp = nnlib.Preprocessor(xLength, opcodeFile=fpOpcodeJson, segFile=fpSegPickle, options=fpOptions, 
-    DB_name=fpDBName, DB_sqldir=fpSQLDir, DB_loaddata=False)
+    DB_name=fpDBName, DB_sqldir=fpSQLDir)
 pp.dumpData(fpDataDir, fpDumpDir, fpDataID)
 
 for o in fpOptions:
