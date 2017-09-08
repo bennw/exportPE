@@ -212,7 +212,7 @@ options:
 """
 class Preprocessor:
     def __init__(self, xLength, opcodeFile=None, segFile=None, maxFileSize=1.5*(10**6), options='hef',
-        DB_user="root", DB_pass="benben", DB_name="UAVDB2", DB_loaddata=True, DB_sqldir="./"):
+        DB_user="root", DB_pass="", DB_name="UAVDB2", DB_loaddata=True, DB_sqldir="./"):
         self.inputLength = {}
         i = 0
         for o in options:
