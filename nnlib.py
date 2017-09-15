@@ -1,4 +1,4 @@
-from __future__ import division # For py2: makes all "/" perform true division
+from __future__ import division
 from capstone import *
 import collections
 from datetime import datetime
@@ -13,11 +13,25 @@ import pickle
 import pymysql
 from scipy import misc
 from shutil import copyfile
+import subprocess
 import sys
+import time
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 
+"""
+getDump<X>: gets filename/sample statistics from a data dump collection
+Dumps are identified by their ID (arg: dumpID) and the model/option (arg: option).
 
+Args:
+    dumpDir: directory containing dump files
+    dumpID, option: see method description
+    number: fetches the nth dump file
+
+Returns:
+    <X>=file: path to dump file
+    <X>=stats: class weight for positive samples
+"""
 def getDumpFile(dumpDir, dumpID, option, number):
     return join(dumpDir, 'data-' + dumpID + '-' + option + '-' + str(number) + '.pickle')
 
@@ -37,7 +51,7 @@ def getDumpStats(dumpDir, dumpID, option):
     print("Positives: " + str(n1))
     print("Percentage positive: " + str(makePercentage(n1/(n0+n1))) + "%")
     print("Class weight: " + str(n0/n1))
-    return math.floor(n1/n0)
+    return math.floor(n0/n1)
 
 """
 makePercentage: example use - for input probability p=0.12345, dp=2, 
@@ -69,12 +83,64 @@ def readFromFile(file, options='rb'):
     fd.close()
     return data 
 
-def readFromFileEX(file, options='rb', start=0, length=0):
+def readFromFileEX(file, options='rb', start=0, length=0, readFromBack=False):
+    if readFromBack:
+        s=2
+    else:
+        s=0
     fd = open(file, options)
-    fd.seek(start)
+    fd.seek(start, s)
     data = fd.read(length)
     fd.close()
     return data 
+
+"""
+getCodeSectionFromFile: takes in a PE file (arg: file), and finds the address and length of the code section
+
+Args:
+    file: PE file
+Returns:
+    text_start: pointer (address) to start of section. -1 if section not found  / invalid input file.
+    text_length: length of section. -1 if section not found / invalid input file.
+    entry_offset: pointer (address) to entry point. -1 if section not found / invalid input file.
+"""
+def getCodeSectionFromFile(pe_file):
+    sectionName = [b'.text', b'UPX0', b'CODE', b'RT_CODE', b'.itext', b'Exe']
+    pe = pefile.PE(pe_file)
+    entry_virtual = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+    for section in pe.sections:
+        for sName in sectionName:
+            if section.Name[0:len(sName)] == sName:
+                text_start = section.PointerToRawData
+                text_length = section.Misc_VirtualSize
+                text_start_virtual = section.VirtualAddress
+                entry_offset = entry_virtual-text_start_virtual + text_start
+                return text_start, text_length, entry_offset
+    return -1, -1, -1
+
+"""
+getArchitecture: takes in a PE file (arg: file), and finds the target architecture and mode
+
+Args:
+    file: PE file
+Returns:
+    ARCH, MODE: aliases defined in capstone library
+"""
+def getArchitecture(pe_file):
+    pe = pefile.PE(pe_file)
+    if pe.FILE_HEADER.Machine == 0x14c:
+        return CS_ARCH_X86, CS_MODE_32
+    elif pe.FILE_HEADER.Machine == 0x8664:
+        return CS_ARCH_X86, CS_MODE_64
+    elif pe.FILE_HEADER.Machine == 0x1c0:
+        return CS_ARCH_ARM, CS_MODE_ARM
+    elif pe.FILE_HEADER.Machine == 0x1c2 or pe.FILE_HEADER.Machine == 0x1c4:
+        return CS_ARCH_ARM, CS_MODE_THUMB
+    elif pe.FILE_HEADER.Machine == 0xAA64:
+        return CS_ARCH_ARM64, CS_MODE_ARM
+    else:
+        print(pe_file + " has unrecognised bit mode " + hex(pe.FILE_HEADER.Machine))
+    return CS_ARCH_X86, CS_MODE_32
 
 """
 bytesToList: returns list of integers (range: 0-255) corresponding to an input byte list (arg: bytes)
@@ -89,12 +155,7 @@ Returns:
     result: resulting integer list. Maximum length of maxLen is guaranteed; no minimum length guarantees.
 """
 def bytesToList(bytes, startIndex, maxLen, offset=1):
-    result = []
-    i = 0
-    for j in list(bytes[startIndex:startIndex+maxLen]):
-        x = j + offset
-        result.append(x)
-        i += 1
+    result = [ i + offset for i in list(bytes[startIndex:startIndex+maxLen]) ]
     return result
 
 """
@@ -141,12 +202,13 @@ printResultsAggregated: prints the confusion matrix, accuracy, precision and rec
 Args:
     predicted: list/array of one-hot predictions
     actual: list/array of one-hot actual labels
+    threshold: prediction has range 0 <= prediction <= 1. Threshold divides this range into positive/negative.
 """
-def printResultsAggregated(predicted, actual):
+def printResultsAggregated(predicted, actual, threshold=0.5):
     TP, FP, FN, TN = (0,0,0,0) # FP: false alarm; FN: malware slipped through the cracks
     for i in range(len(actual)):
-        p = predicted[i] > 0.5
-        t = abs(actual[i]-predicted[i]) < 0.5
+        p = predicted[i] > threshold
+        t = p == actual[i]
         if t:
             if p:
                 TP += 1
@@ -157,7 +219,7 @@ def printResultsAggregated(predicted, actual):
                 FP += 1
             else:
                 FN += 1
-    print( "\nTP  \tFP  \tFN  \tTN"  )
+    print( "TP  \tFP  \tFN  \tTN"  )
     print( str(TP) + "\t" + str(FP) + "\t" + str(FN) + "\t" + str(TN) )
     if TP == 0:
         print( "No true positives. End of results." )
@@ -165,6 +227,7 @@ def printResultsAggregated(predicted, actual):
     print( "Accuracy: " + str(makePercentage((TP+TN)/len(actual))) + "%" )
     print( "Precision: " + str(makePercentage((TP)/(TP+FP))) + "%" )
     print( "Recall: " + str(makePercentage((TP)/(TP+FN))) + "%" )
+    print( "FP Rate: " + str(makePercentage((FP)/(FP+TN))) + "%" )
 
 """
 getSQLFileFromDir: given a directory, returns the full path of the first .sql file inside
@@ -211,18 +274,26 @@ options:
     i: 2048-hashed import functions
 """
 class Preprocessor:
-    def __init__(self, xLength, opcodeFile=None, segFile=None, maxFileSize=1.5*(10**6), options='hef',
-        DB_user="root", DB_pass="benben", DB_name="UAVDB2", DB_loaddata=True, DB_sqldir="./"):
+    def __init__(self, xLength, refFileDict=None, segFile=None, copyDir=None, maxFileSize=1.5*(10**6), options='hef',
+        DB_user="root", DB_pass="", DB_name="UAVDB2", DB_loaddata=True, DB_sqldir="./"):
         self.inputLength = {}
+        self.refList = {}
+        self.copyDir = copyDir
         i = 0
         for o in options:
             self.inputLength[o] = xLength[i]
             i += 1
-        if 'o' in options or 'f' in options:
-            fj = open(opcodeFile, 'r')
-            self.opcodeList = json.loads(fj.read())
-            fj.close()
-            self.inputLength['f'] = len(self.opcodeList) + 1
+        for o in 'fone':
+            if o in options:
+                fj = open(refFileDict[o], 'r')
+                self.refList[o] = json.loads(fj.read())
+                fj.close()
+                if o == 'e':
+                    self.opcodeDict = collections.defaultdict(int)
+                    n = 1
+                    for opcode in self.refList[o]:
+                        self.opcodeDict[opcode] = n
+                        n += 1
         if 's' in options:
             with open(segFile, "rb") as f:
                 self.segList = pickle.load(f)
@@ -296,30 +367,6 @@ class Preprocessor:
         return result['IsVirus']
 
     """
-    getCodeSectionFromFile: takes in a PE file (arg: file), and finds the address and length of the code section
-
-    Args:
-        file: PE file
-    Returns:
-        text_start: pointer (address) to start of section. -1 if section not found  / invalid input file.
-        text_length: length of section. -1 if section not found / invalid input file.
-        entry_offset: pointer (address) to entry point. -1 if section not found / invalid input file.
-    """
-    def getCodeSectionFromFile(self, pe_file):
-        sectionName = [b'.text', b'UPX0', b'CODE', b'RT_CODE', b'.itext', b'Exe']
-        pe = pefile.PE(pe_file)
-        entry_virtual = pe.OPTIONAL_HEADER.AddressOfEntryPoint
-        for section in pe.sections:
-            for sName in sectionName:
-                if section.Name[0:len(sName)] == sName:
-                    text_start = section.PointerToRawData
-                    text_length = section.Misc_VirtualSize
-                    text_start_virtual = section.VirtualAddress
-                    entry_offset = entry_virtual-text_start_virtual + text_start
-                    return text_start, text_length, entry_offset
-        return -1, -1, -1
-
-    """
     getHashedImportListFromFile: takes in a PE file (arg: file), retrieving DLL imports.
     Import function names go through a size-2048 hash.
     Returns a size-2048 list of binary values corresponding to whether the PE file has import(s) with that hash.
@@ -348,8 +395,8 @@ class Preprocessor:
 
     """
     getOpcodeFreqList: constructs histogram of opcodes from bytes, in the form of a list (freq_list).
-    This list has indices mapped to opcodeList (i.e. opcode opcodeList[n] has frequency freq_list[n]);
-    The last element of freq_list counts the frequency of opcodes not in opcodeList.
+    This list has indices mapped to the reference list (i.e. opcode refList[n] has frequency freq_list[n]);
+    The last element of freq_list counts the frequency of opcodes not in refList.
 
     Args:
         bytes: sequence/list of bytes to be counted
@@ -365,47 +412,95 @@ class Preprocessor:
         md.skipdata = True
         for i in md.disasm(bytes[startIndex:startIndex+length], startIndex):
             freq_dict[i.mnemonic] += 1
-        freq_list = mapDictToList(freq_dict, self.opcodeList)
+        freq_list = mapDictToList(freq_dict, self.refList['f'])
         return freq_list
 
-    def getSegEntropyList(self, file):
-        freq_dict = collections.defaultdict(float)
-        pe = pefile.PE(file)
-        for section in pe.sections:
-            freq_dict[section.Name] = section.get_entropy()
+    def getSegCountList(self, file):
+        freq_dict = collections.defaultdict(int)
+        cmd = subprocess.run(["objdump", "-D", file], stdout=subprocess.PIPE)
+        if cmd.returncode != 0:
+            raise FileError(file, "objdump throws exception")
+        asm = cmd.stdout.split(b'\nDisassembly of section ')
+        bDiscardedFirstSection = False
+        for section in asm:
+            if not bDiscardedFirstSection:
+                bDiscardedFirstSection = True
+                continue
+            name = section.split(b':')[0]
+            while len(name) < 8:
+                name += b'\x00'
+            freq_dict[name] = section.count(b"\n") - 2
+            # print(str(name) + ": length " + str(section.count(b"\n") - 2))
         freq_list = mapDictToList(freq_dict, self.segList)
-        return freq_list        
+        return freq_list   
 
     """
-    bytesToOpcodes: takes in a list of bytes (arg: bytes), and retrieves the first n opcodes (n = maxLen), 
-    translating them into corresponding numbers and returning the list
-    If there are too few opcodes, result list is zero-padded.
+    getOpcodeList: constructs histogram of opcodes from bytes, in the form of a list (freq_list).
+    This list has indices mapped to the reference list (i.e. opcode refList[n] has frequency freq_list[n]);
+    The last element of freq_list counts the frequency of opcodes not in refList.
 
     Args:
-        bytes: see method description
-        startIndex: index of bytes[] from which to begin retrieving opcodes
-        length: maximum number of bytes to scan
-        maxLen: maximum number of opcodes to return
+        bytes: sequence/list of bytes to be counted
+        startIndex: start index of bytes[] to be counted
+        length: number of bytes to be counted
+
     Returns:
-        result: sequential list of numbers which indicate opcodes in file
+        freq_list: see method description
     """
-    def bytesToOpcodes(self, bytes, startIndex, length, maxLen):
-        result = []
-        md = Cs(CS_ARCH_X86, CS_MODE_32)
+    def getOpcodeList(self, bytes, mode, opcodeLength, startIndex=0):
+        result = [0] * opcodeLength
+        md = Cs(mode[0], mode[1])
         md.skipdata = True
+        n = 0
+        for i in md.disasm(bytes[startIndex:], 0):
+            result[n] = self.opcodeDict[i.mnemonic]
+            n += 1
+            if n >= opcodeLength:
+                break
+        return result   
+
+    """
+    getNgramFreqListEX: generates a list wherein each element corresponds to an n-gram as given in the ngramList.
+    Element=0 indicates the ngram is absent in the current file, element=1 indicates presence.
+
+    Args:
+        file: binary file path
+        mode: 2-tuple, gives the architecture (e.g. x86) and mode of the file (e.g. 32-bit)
+        ngramList: see method description
+        codeStart: starting offset
+        codeLength: length of code section
+        maxLength: maximum number of bytes to read
+    Returns:
+        result: see method description
+    """
+    def getNgramFreqListEX(self, file, mode, ngramList, outputLength, codeStart, codeLength, maxLength=100000):
+        freq_dict = collections.defaultdict(int)
+        cmpFactor = math.ceil( len(ngramList) / outputLength )
+        result = [0] * outputLength
+        bytes = readFromFileEX(file, start=codeStart, length=min(maxLength,codeLength))
+        md = Cs(mode[0], mode[1])
+        md.skipdata = True
+        opcodes = []
+        for i in md.disasm(bytes, 0):
+            opcodes.append(i.mnemonic)
+            if len(opcodes) >= 2:
+                ngram = tuple(opcodes[-2:])
+                freq_dict[ngram] += 1
+            if len(opcodes) >= 3:
+                ngram = tuple(opcodes[-3:])
+                freq_dict[ngram] += 1
+            if len(opcodes) >= 4:
+                ngram = tuple(opcodes[-4:])
+                freq_dict[ngram] += 1
         i = 0
-        for j in md.disasm(bytes[startIndex:startIndex+length], startIndex):
-            try:
-                x = self.opcodeList.index(j.mnemonic) + 1
-                result.append(x)
-            except ValueError:
-                x = len(self.opcodeList) + 1 # "other"
-                result.append(x)
-            i += 1
-            if i >= maxLen:
-                return result
-        if i == 0:
-            raise FileError("", "No opcodes detected in file")
+        # for opcode in ngramList:
+        #     if freq_dict[tuple(opcode)] == 1:
+        #         result[int(math.floor(i/cmpFactor))] += 1/cmpFactor
+            # i += 1
+        for opcode in ngramList:
+            if freq_dict[tuple(opcode)] > 0:
+                result[i] = freq_dict[tuple(opcode)]
+                i += 1
         return result
 
     """
@@ -461,37 +556,71 @@ class Preprocessor:
     """
     def getDataFromFile(self, filefullpath):
         tmp = {}
+        data = readFromFileEX(filefullpath, start=0, length=768)
+        if not b'MZ' == data[:2]:
+            raise FileError(filefullpath, "Not a valid PE file")
+        if not any(b'PE' == data[i:i+2] for i in range(len(data) - 1)):
+            raise FileError(filefullpath, "Not a valid PE file")
         for o in self.options:
             if o == 'h':
                 data = readFromFileEX(filefullpath, start=0, length=self.inputLength['h'])
                 data = bytesToList(data, 0, self.inputLength['h'])
                 tmp[o] = padList( data , self.inputLength['h'], 0 )
+            elif o == 'b':
+                head = readFromFileEX(filefullpath, start=0, length=self.inputLength['b']//2)
+                head = bytesToList(head, 0, self.inputLength['b']//2)
+                tail = readFromFileEX(filefullpath, start=-self.inputLength['b']//2, length=self.inputLength['b']//2, readFromBack=True)
+                tail = bytesToList(tail, 0, self.inputLength['b']//2)
+                head.extend(tail)
+                tmp[o] = head
             elif o == 'e':
-                text_start, x_, entry_addr = self.getCodeSectionFromFile(filefullpath)
+                text_start, text_len, entry_addr = getCodeSectionFromFile(filefullpath)
+                if text_start == -1:
+                    raise FileError(filefullpath, "Not a valid PE file")
                 if entry_addr < -1: # virtual entry addr missing for some reason. Use start of code section instead
                     entry_addr = text_start
-                data = readFromFileEX(filefullpath, start=entry_addr, length=self.inputLength['e'])
-                tmp[o] = padList( list(data) , self.inputLength['e'], 0 )
-            # elif o == 'o':
-            #     text_start, text_length, x = self.getCodeSectionFromFile(filefullpath)
-            #     if text_start == -1:
-            #         raise FileError(filefullpath, "Not a valid PE file")
-            #     tmp[o] = padList( self.bytesToOpcodes(data, text_start, text_length, self.inputLength['o']),
-            #         self.inputLength['o'], 0)
+                entry_len = text_len - (entry_addr-text_start)
+                if entry_len <= 500:
+                    data = readFromFileEX(filefullpath, start=text_start, length=text_len)
+                else:
+                    data = readFromFileEX(filefullpath, start=entry_addr, length=entry_len)
+                mode = getArchitecture(filefullpath)
+                result = self.getOpcodeList(data, mode, self.inputLength['e'])
+                tmp[o] = padList( list(result) , self.inputLength['e'], 0 )
+            elif o in 'no':
+                text_start, text_length, x = getCodeSectionFromFile(filefullpath)
+                if text_start == -1:
+                    raise FileError(filefullpath, "Not a valid PE file")
+                mode = getArchitecture(filefullpath)
+                freq = self.getNgramFreqListEX(filefullpath, mode, self.refList[o], self.inputLength[o], text_start, text_length)
+                if sum(freq) == 0:
+                    raise FileError("", "No opcodes detected in file")
+                tmp[o] = freq
+                # tmp[o] = [float(i)/max(freq) for i in freq]
             elif o == 'f':
                 data = readFromFile(filefullpath)
-                text_start, text_length, x = self.getCodeSectionFromFile(filefullpath)
+                text_start, text_length, x = getCodeSectionFromFile(filefullpath)
                 if text_start == -1:
                     raise FileError(filefullpath, "Not a valid PE file")
                 freq = self.getOpcodeFreqList(data, text_start, text_length)
                 if sum(freq_list) == 0:
                     raise FileError("", "No opcodes detected in file")
                 tmp[o] = [float(i)/sum(freq) for i in freq] # normalise before returning as output
+            # elif o == 'i':
+            #     tmp[o] = self.getHashedImportListFromFile(filefullpath)
             elif o == 'i':
-                tmp[o] = self.getHashedImportListFromFile(filefullpath)
+                data = readFromFile(filefullpath)
+                # reshape data to 2d with zero padding at end
+                # normalising it to [0,1] range
+                # finally resizing it to 256x256 elements
+                nBytes = len(data)
+                nSide = int(math.ceil(math.sqrt(nBytes)))
+                data = padList( list(data) , nSide*nSide, 0 )
+                data = np.reshape(data, (nSide,nSide))
+                tmp[o] = misc.imresize(data, (256, 256, 1))
             elif o == 's':
-                freq = self.getSegEntropyList(filefullpath)
-                tmp[o] = [i/8. for i in freq] # normalise; entropy ranges from 0 to 8
+                tmp[o] = self.getSegCountList(filefullpath)
+                # tmp[o] = [i/8. for i in freq] # normalise; entropy ranges from 0 to 8
         return tmp
 
     '''
@@ -521,13 +650,13 @@ class Preprocessor:
                 # subfolders.sort()
                 files.sort()
                 for file in files:
-                    if __debug__ and True:
-                        if (n0+n1) % 100 == 0:
-                            print("File #" + str(n0+n1))
                     exe_path = join( root, file )
                     try:
                         label = self.getLabelFromDB(file)
                         tmp = self.getDataFromFile(exe_path)
+                        if __debug__ and True:
+                            if (n0+n1) % 1000 == 0:
+                                print("File #" + str(n0+n1))
                         isPartitioned = False
                         if y == 1:
                             n1 += 1
@@ -565,12 +694,23 @@ class Preprocessor:
         print("Positive sample count: " + str(n1))
         return x, y, xp, yp
 
+    '''
+    dumpData: the input directory (arg: filedir) contains data files, which will be preprocessed and
+    dumped to .pickle files in the dump directory (arg: dumpDir). Each pickle file has up to (arg: dumpSize) files
+    and up to a total of (arg: maxFiles) files will be processed.
+
+    Args:
+        dumpID: identifier for dataset being used
+        (other args): see method description
+    '''
+
     def dumpData(self, fileDir, dumpDir, dumpID, dumpSize=20000, maxFiles=-1):
         y = []
         x = {}
         n0 = 0
         n1 = 0
         nDump = dumpSize
+        skipAhead = True
         if isfile(getDumpFile(dumpDir, dumpID, self.options[0:1], 1)):
             return
         n0old = 0
@@ -580,15 +720,24 @@ class Preprocessor:
         for d in fileDir:
             for root, subfolders, files in os.walk(d):
                 # subfolders.sort()
-                files.sort()
+                files.sort(reverse=True)
                 for file in files:
-                    if __debug__ and False:
-                        if (n0+n1) % 100 == 0:
-                            print("File #" + str(n0+n1))
                     exe_path = join( root, file )
                     try:
+                        ### HACKY BEGIN
+                        # if skipAhead:
+                        #     if file != "AC02588AD9DF13DD04FD0EDA92F9F23514FF797051694BE82F4D13E05B16D9C5_9801":
+                        #         continue
+                        #     else:
+                        #         skipAhead = False
+                        #         print("Continuing from last dumpload...")
+                        #         (n0, n0old, n1, n1old, nDump) = (39082, 39082, 918, 918, 60000)
+                        ### HACKY END
                         label = self.getLabelFromDB(file)
                         tmp = self.getDataFromFile(exe_path)
+                        if __debug__ and True:
+                            if (n0+n1) % 2000 == 0:
+                                print(str(time.ctime()) + ": File #" + str(n0+n1))
                         if label == 1:
                             n1 += 1
                         else:
@@ -606,6 +755,7 @@ class Preprocessor:
                             x = {}
                             for o in self.options:
                                 x[o] = []
+                            print(time.ctime())
                             print("Dump #" + str((n0+n1)//dumpSize))
                             print("Negative sample count: " + str(n0-n0old))
                             print("Positive sample count: " + str(n1-n1old))
@@ -613,18 +763,18 @@ class Preprocessor:
                             (n0old, n1old) = (n0, n1)
                         if maxFiles != -1 and (n0+n1) >= maxFiles:
                             break
-                    except IOError as e:
-                        print("IOError with " + exe_path + ":" + str(e))
-                    except CsError as e:
-                        print("CsError: %s" %e)
-                    except FileError as e:
-                        print("Error in file " + e.file + ": " + e.msg)
-                    except TypeError as e:
-                        print("TypeError for file " + file + ": " + str(e))
-                    except pefile.PEFormatError as e:
-                        print(file + " is not a valid PE file.")
-                    # except (IOError, CsError, FileError, TypeError, pefile.PEFormatError) as e:
-                    #     pass
+                    # except IOError as e:
+                    #     print("IOError with " + exe_path + ":" + str(e))
+                    # except CsError as e:
+                    #     print("CsError: %s" %e)
+                    # except FileError as e:
+                    #     print("Error in file " + e.file + ": " + e.msg)
+                    # except TypeError as e:
+                    #     print("TypeError for file " + file + ": " + str(e))
+                    # except pefile.PEFormatError as e:
+                    #     print(file + " is not a valid PE file.")
+                    except (IOError, CsError, FileError, TypeError, pefile.PEFormatError) as e:
+                        pass
                 if maxFiles != -1 and (n0+n1) >= maxFiles:
                     break
         print("Total negative sample count: " + str(n0))
